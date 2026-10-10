@@ -22,8 +22,8 @@ APKSIGNER="$BT/apksigner.bat"
 
 MIN_SDK=29
 TGT_SDK=34
-VER_CODE=9
-VER_NAME=1.6.1
+VER_CODE=10
+VER_NAME=1.6.2
 
 echo "==================================================="
 echo " 构建 番茄Hook (LSPosed 模块)  v$VER_NAME"

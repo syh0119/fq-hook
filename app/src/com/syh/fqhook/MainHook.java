@@ -99,7 +99,7 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
 public class MainHook implements IXposedHookLoadPackage {
 
     // ══════════════ 常量 ══════════════
-    private static final String VERSION = "1.6.1";
+    private static final String VERSION = "1.6.2";
     private static final String TAG = "FQHook";
     private static final String PKG = "com.dragon.read";
     private static final String REL_ROOT = "Download/番茄导出";   // MediaStore RELATIVE_PATH
@@ -1963,10 +1963,13 @@ public class MainHook implements IXposedHookLoadPackage {
 
         TextView expHint = new TextView(act);
         expHint.setText(LAST_BOOK_ID == null
-                ? "还没捕获到章节 —— 先打开一本书读几页，或点一次「下载」"
-                : "已缓存 " + bufCount(LAST_BOOK_ID) + " 章，点上面按钮写出整本（导出后自动与原始 XHTML 校对）");
+                ? "① 先在番茄里打开本书，点阅读页顶部的「下载」\n"
+                + "② 再回到这里，点上面的「导出本书」"
+                : "已缓存 " + bufCount(LAST_BOOK_ID) + " 章 —— 点上面「导出本书」写出整本\n"
+                + "导出后自动与原始 XHTML 校对");
         expHint.setTextSize(11);
         expHint.setTextColor(0xFF8E8E94);
+        expHint.setLineSpacing(dp(act, 3), 1f);
         expHint.setPadding(0, dp(act, 6), 0, 0);
         expRow.addView(expHint);
 
@@ -2287,7 +2290,7 @@ public class MainHook implements IXposedHookLoadPackage {
     private void exportBook(final Activity act) {
         final String bid = LAST_BOOK_ID;
         if (bid == null) {
-            toast(act, "还没捕获到章节 —— 先打开一本书读几页，或点一次「下载」");
+            toast(act, "还没捕获到章节 —— 先在番茄里打开本书，点阅读页顶部的「下载」");
             return;
         }
         final Map<String, ChapterBuf> m = BUF.get(bid);
