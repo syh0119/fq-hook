@@ -46,6 +46,7 @@ import java.util.Collections;
 import java.util.Comparator;
 import java.util.Date;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedList;
 import java.util.List;
@@ -63,6 +64,7 @@ import java.util.regex.Pattern;
 import java.util.zip.CRC32;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
 import java.util.zip.ZipOutputStream;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
@@ -91,22 +93,23 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  * ── 输出（公共目录，MediaStore 写入，targetSdk=35 作用域存储下唯一可靠路径）──
  *   /sdcard/Download/番茄导出/
  *     _开关.txt                可编辑开关（force / xhtml / images）
- *     _运行日志.txt            运行日志
- *     丁丁/<0001>_第1章 xxx.txt
- *     丁丁/插图/<hash>.jpg      内嵌插图（番茄私有目录里是明文 JPEG，进程内直读，无需 root）
- *     丁丁/_章节索引.tsv        逐章索引（追加）
+ *     _运行日志.txt            运行日志（含校对全文）
+ *     《丁丁》.txt / .html     整本导出（文件名自带书名，直接落在根目录）
+ *     《丁丁》.epub            整本导出 EPUB
+ *   v1.9.0 起不再为每本书建子目录、不再写 _校对报告.txt ——
+ *   用户要的是「打开 Download 一眼看到所有小说」，多一层目录就多一次点击。
  */
 public class MainHook implements IXposedHookLoadPackage {
 
     // ══════════════ 常量 ══════════════
-    private static final String VERSION = "1.6.2";
+    private static final String VERSION = "1.10.0";
     private static final String TAG = "FQHook";
     private static final String PKG = "com.dragon.read";
     private static final String REL_ROOT = "Download/番茄导出";   // MediaStore RELATIVE_PATH
     private static final String SWITCH_FILE = "_开关.txt";
     private static final String LOG_FILE = "_运行日志.txt";
     private static final String IDX_FILE = "_章节索引.tsv";
-    private static final String VERIFY_FILE = "_校对报告.txt";
+    // v1.9.0 起不再生成 _校对报告.txt：Download 里只留小说文件，校对全文进 _运行日志.txt
     private static final String UNKNOWN_BOOK = "_未归类";
     private static final String PREFS = "fqhook";
     private static final String FMT_TXT = "txt";
@@ -119,7 +122,31 @@ public class MainHook implements IXposedHookLoadPackage {
     private static final Pattern P_NUM = Pattern.compile("第\\s*([0-9]+)\\s*[章节回卷]");
     private static final Pattern P_NUM_CN = Pattern.compile("第\\s*([〇零一二三四五六七八九两十百千万]+)\\s*[章节回卷]");
     private static final String CN_DIGITS = "一二三四五六七八九";
-    private static final SimpleDateFormat TS = new SimpleDateFormat("MM-dd HH:mm:ss", Locale.US);
+
+    /**
+     * 时间戳格式化 —— 必须线程安全。
+     * 原来是一个静态 SimpleDateFormat，被 hook 回调线程 / 8 线程导出池 / UI 线程
+     * 同时使用；SimpleDateFormat 非线程安全，会产出错乱时间戳，极端情况下抛异常，
+     * 把 log() 链路一起打断。改成 ThreadLocal（每线程一个实例）。
+     */
+    private static final ThreadLocal<SimpleDateFormat> TS_TL =
+            new ThreadLocal<SimpleDateFormat>() {
+                @Override protected SimpleDateFormat initialValue() {
+                    return new SimpleDateFormat("MM-dd HH:mm:ss", Locale.US);
+                }
+            };
+    /** ISO 8601 / W3CDTF —— EPUB 的 dc:date 只认这个格式 */
+    private static final ThreadLocal<SimpleDateFormat> ISO_TL =
+            new ThreadLocal<SimpleDateFormat>() {
+                @Override protected SimpleDateFormat initialValue() {
+                    return new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssXXX", Locale.US);
+                }
+            };
+
+    /** 人类可读时间戳（日志 / 报告用） */
+    private static String ts() { return TS_TL.get().format(new Date()); }
+    /** ISO 8601 时间戳（EPUB 元数据用） */
+    private static String iso() { return ISO_TL.get().format(new Date()); }
 
     // ══════════════ 运行状态 ══════════════
     private static Context APP;
@@ -155,6 +182,14 @@ public class MainHook implements IXposedHookLoadPackage {
     private static final Set<String> SEEN =
             java.util.Collections.synchronizedSet(new java.util.HashSet<String>());
     private static final AtomicInteger SEQ = new AtomicInteger(0);
+
+    /**
+     * 导出单飞锁。原来没有锁：POOL 是 8 线程池，连点两次「导出本书」就会有两个任务
+     * 同时写同一个书名目录下的同名文件，插图编号（i0001…）也会互相踩。
+     * 产物混在一起且无任何报错。
+     */
+    private static final java.util.concurrent.atomic.AtomicBoolean EXPORTING =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
 
     private static volatile boolean cfgForce = false;
     private static volatile boolean cfgXhtml = false;
@@ -221,6 +256,29 @@ public class MainHook implements IXposedHookLoadPackage {
     private static final int BUF_MAX_PER_BOOK = 5000;
     private static volatile String LAST_BOOK_ID;
     private static volatile String LAST_BOOK_NAME;
+    /**
+     *  书籍台账：bookId → 书名 + 最后捕获到该书的时刻。
+     *  BUF 早就按 bookId 分桶了，但 bufPut 每章都覆盖 LAST_BOOK_ID，
+     *  UI 又只认它 —— 于是只能导出「最后碰过的那一本」。
+     *  有了台账才能列清单让用户挑；排序用 lastSeen，最近读的排最前。
+     */
+    private static final Map<String, String> BOOK_NAME = new ConcurrentHashMap<String, String>();
+    private static final Map<String, Long> BOOK_SEEN = new ConcurrentHashMap<String, Long>();
+
+    /**
+     *  面板里当前选中的书 —— **多选集合**。
+     *  原来是单个 SEL_BOOK_ID，点第二本就把第一本顶掉了，想导两本得导两次、开两次面板。
+     *  改成集合后：点行只翻转集合成员，底部按钮按集合里的书逐本导出。
+     *  并发写用 ConcurrentHashMap 支撑的集合（面板与导出线程都会读）。
+     */
+    private static final Set<String> SEL_BOOKS =
+            Collections.newSetFromMap(new ConcurrentHashMap<String, Boolean>());
+
+    // 面板里的活动部件引用：选中变化时原地重画，不必关掉对话框
+    private static LinearLayout PANEL_LIST;
+    private static TextView PANEL_LABEL;
+    private static TextView PANEL_EXPORT;
+    private static TextView PANEL_HINT;
 
     static final class ChapterBuf {
         final int ord;          // 章节号（排序用，-1 = 没解析出来）
@@ -241,6 +299,8 @@ public class MainHook implements IXposedHookLoadPackage {
         }
         if (m.size() >= BUF_MAX_PER_BOOK && !m.containsKey(in.chapterId)) return -1;
         m.put(in.chapterId, new ChapterBuf(ordinal(in.chapterName), in.chapterName, xml));
+        if (notEmpty(in.bookName)) BOOK_NAME.put(in.bookId, in.bookName);
+        BOOK_SEEN.put(in.bookId, Long.valueOf(System.currentTimeMillis()));
         LAST_BOOK_ID = in.bookId;
         LAST_BOOK_NAME = in.bookName;
         return m.size();
@@ -728,7 +788,8 @@ public class MainHook implements IXposedHookLoadPackage {
         String bookId = (info == null) ? null : info.bookId;
         String title = (info != null && notEmpty(info.chapterName)) ? info.chapterName.trim() : "";
         Map<String, byte[]> imgs = new HashMap<String, byte[]>();
-        List<Blk> blks = extractBlocks(x, bookId, imgs);
+        boolean[] degraded = new boolean[1];
+        List<Blk> blks = extractBlocks(x, bookId, imgs, degraded);
         if (blks.isEmpty()) return;
         if (title.isEmpty()) title = firstBlockText(blks);
         if (title.isEmpty()) {
@@ -740,9 +801,11 @@ public class MainHook implements IXposedHookLoadPackage {
             blks.remove(0);
         }
 
-        String rel = REL_ROOT + "/" + safe(book, 60);
+        // 单章自动导出：也直落根目录，章节文件名里带上书名
+        String rel = REL_ROOT;
+        String bookTag = safe(book, 40) + "_";
         final String pf = prefix(info, title);
-        String fname = pf + "_" + safe(title, 80) + ".txt";
+        String fname = bookTag + pf + "_" + safe(title, 60) + ".txt";
         String hashTag = (info != null && info.hash != null) ? info.hash : md5hex(xml);
 
         if (info == null && !cfgForce && SEEN.contains(hashTag)) return;
@@ -763,16 +826,17 @@ public class MainHook implements IXposedHookLoadPackage {
             for (Blk b : blks) {
                 if (b.kind != Blk.IMG || b.img == null) continue;
                 boolean png = isPng(b.img);
-                if (writePublic(rel + "/插图", b.imgKey + (png ? ".png" : ".jpg"),
+                if (writePublic(rel, bookTag + b.imgKey + (png ? ".png" : ".jpg"),
                         b.img, png ? "image/png" : "image/jpeg")) imgOk++;
             }
         }
         // 3) xhtml（开关）
         if (cfgXhtml) {
-            writePublic(rel, pf + "_" + safe(title, 80) + ".xhtml", xml, "application/octet-stream");
+            writePublic(rel, bookTag + pf + "_" + safe(title, 60) + ".xhtml", xml,
+                    "application/octet-stream");
         }
         // 4) 索引
-        appendIndex(rel, info, pf, title, fname, txt.length, imgOk, src);
+        appendIndex(rel, book, info, pf, title, fname, txt.length, imgOk, src);
 
         if (info != null) {
             markDone(info);
@@ -799,7 +863,7 @@ public class MainHook implements IXposedHookLoadPackage {
             if (x.kind == Blk.IMG) {
                 b.append("【插图】");
                 if (notEmpty(x.text)) b.append(x.text);
-                if (x.img != null) b.append("  →  插图/").append(x.imgKey).append(isPng(x.img) ? ".png" : ".jpg");
+                if (x.img != null) b.append("  →  ").append(safe(book, 40)).append('_').append(x.imgKey).append(isPng(x.img) ? ".png" : ".jpg");
                 else if (notEmpty(x.imgKey)) b.append("  (图片未缓存)");
                 b.append("\n");
             } else {
@@ -869,8 +933,13 @@ public class MainHook implements IXposedHookLoadPackage {
 
     // ═══════════════════════════════════════════════════════════
     //  XHTML → 块（与独立导出器 v1.4 同源逻辑）
+    //
+    //  ⚠ degraded[]：兜底路径标记。见下方 fallback 处注释 —— 这个标记是
+    //    校对可信度的关键，不能省。
     // ═══════════════════════════════════════════════════════════
-    private List<Blk> extractBlocks(String xml, String bookId, Map<String, byte[]> imgs) {
+    private List<Blk> extractBlocks(String xml, String bookId, Map<String, byte[]> imgs,
+                                    boolean[] degraded) {
+        if (degraded != null) degraded[0] = false;
         List<Blk> out = new ArrayList<Blk>();
         int i = 0, n = xml.length();
         while (i < n) {
@@ -901,6 +970,16 @@ public class MainHook implements IXposedHookLoadPackage {
             i = e + 6;
         }
         if (out.isEmpty()) {
+            // ── 兜底：一个 <blk> / image div 都没认出来 ──
+            // 把整份 XHTML 去标签后当成一个整块。这样「能出字」，但**结构全丢**
+            // （段落、图注、图文顺序都塌成一坨）。
+            //
+            // 致命之处在于：源侧校对口径（rawTextLen）也是「整份去标签数非空白字符」，
+            // 于是兜底路径的字数会与源侧几乎相等 → 判定「无偏差」→ 报告输出
+            // 「✔ 与原始排版一致」。宿主一旦改版（例如 <blk> 换成 <p>），
+            // 解析全灭却报「一致」，用户完全看不出来。
+            // 所以这里必须打上 degraded 标记，由校对方单独判定、禁止给正向结论。
+            if (degraded != null) degraded[0] = true;
             String t = cleanText(xml);
             if (!t.isEmpty()) out.add(text(t));
         }
@@ -1144,13 +1223,15 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    private void appendIndex(String rel, Info info, String pf, String title, String fname,
+    private void appendIndex(String rel, String book, Info info, String pf, String title, String fname,
                              int bytes, int imgs, String src) {
+        // 索引按书分文件：根目录是多本书混放，共用一个 tsv 会互相串行追加
+        String idxName = safe(book, 40) + "_" + IDX_FILE;
         StringBuilder sb = new StringBuilder();
-        if (!indexExists(rel)) {
+        if (!indexExists(rel, idxName)) {
             sb.append("时间\t来源\t章节号\t文件名\t章节名\tchapterId\t字节\t插图\n");
         }
-        sb.append(TS.format(new Date())).append('\t')
+        sb.append(ts()).append('\t')
           .append(src).append('\t')
           .append(pf).append('\t')
           .append(fname).append('\t')
@@ -1158,17 +1239,17 @@ public class MainHook implements IXposedHookLoadPackage {
           .append(info == null || info.chapterId == null ? "" : info.chapterId).append('\t')
           .append(bytes).append('\t')
           .append(imgs).append('\n');
-        appendPublic(rel, IDX_FILE, sb.toString().getBytes(UTF8), "text/tab-separated-values");
+        appendPublic(rel, idxName, sb.toString().getBytes(UTF8), "text/tab-separated-values");
     }
 
-    private boolean indexExists(String rel) {
+    private boolean indexExists(String rel, String idxName) {
         try {
             Cursor c = app().getContentResolver().query(
                     MediaStore.Downloads.EXTERNAL_CONTENT_URI,
                     new String[]{MediaStore.MediaColumns._ID},
                     MediaStore.MediaColumns.RELATIVE_PATH + "=? AND "
                             + MediaStore.MediaColumns.DISPLAY_NAME + "=?",
-                    new String[]{rel + "/", IDX_FILE}, null);
+                    new String[]{rel + "/", idxName}, null);
             if (c == null) return false;
             try { return c.getCount() > 0; } finally { c.close(); }
         } catch (Throwable t) {
@@ -1306,7 +1387,7 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     static void log(String s) {
-        String line = TS.format(new Date()) + "  " + s;
+        String line = ts() + "  " + s;
         XposedBridge.log(TAG + " " + line);
         synchronized (RING) {
             RING.add(line);
@@ -1316,7 +1397,9 @@ public class MainHook implements IXposedHookLoadPackage {
         if (RING_NEW.get() >= 4) flushLog(true);
     }
 
-    private static void flushLog(boolean force) {
+    // 加锁：log() 可能被 hook 线程与 8 线程池同时调用，
+    // 原来「读 lastFlush → 写 lastFlush」是检查-置位竞态，会重复 flush。
+    private static synchronized void flushLog(boolean force) {
         long now = System.currentTimeMillis();
         if (!force && now - lastFlush < 2000) return;
         lastFlush = now;
@@ -1920,79 +2003,114 @@ public class MainHook implements IXposedHookLoadPackage {
         vlp.bottomMargin = dp(act, 10);
         box.addView(ver, vlp);
 
-        // 输出目录
-        TextView dir = new TextView(act);
-        dir.setText("输出目录\n/sdcard/Download/番茄导出/");
-        dir.setTextSize(12);
-        dir.setTextColor(0xFFB8B8BE);
-        LinearLayout.LayoutParams dlp = new LinearLayout.LayoutParams(
+        // ── 主操作：书籍列表 ──
+        //  面板只留三件事：看有哪些书、勾选若干本、点底部统一导出。
+        //  点行不再直接导出 —— 误触就开跑的问题正是这么来的。
+        //  格式 / 开关 / 日志 / 校对 全部下沉到「更多设置」。
+        final List<String> ids = bookIdsByRecent();
+        final int totalBooks = ids.size();
+        int totalCh = 0;
+        for (int i = 0; i < ids.size(); i++) totalCh += bufCount(ids.get(i));
+        // 默认选中最近捕获的那本，省得每次都要手点一下
+        if (totalBooks > 0 && SEL_BOOKS.isEmpty()) SEL_BOOKS.add(ids.get(0));
+
+        TextView listLabel = new TextView(act);
+        listLabel.setText(listLabelText(ids));
+        listLabel.setTextSize(12);
+        listLabel.setTextColor(0xFFB8B8BE);
+        LinearLayout.LayoutParams llp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        dlp.bottomMargin = dp(act, 6);
-        box.addView(dir, dlp);
+        llp.topMargin = dp(act, 4);
+        llp.bottomMargin = dp(act, 6);
+        box.addView(listLabel, llp);
+        PANEL_LABEL = listLabel;
+
+        if (totalBooks == 0) {
+            TextView empty = new TextView(act);
+            empty.setText("① 在番茄里打开任意一本书\n"
+                    + "② 点阅读页顶部的「下载」（或直接往下翻几章）\n"
+                    + "③ 回到这里，书名就会出现在下面列表里");
+            empty.setTextSize(12);
+            empty.setTextColor(0xFF8E8E94);
+            empty.setLineSpacing(dp(act, 4), 1f);
+            box.addView(empty);
+        } else {
+            // 多选辅助条：全选 / 全不选 / 只留最近这本
+            LinearLayout tools = new LinearLayout(act);
+            tools.setOrientation(LinearLayout.HORIZONTAL);
+            tools.setGravity(Gravity.CENTER_VERTICAL);
+            LinearLayout.LayoutParams tlp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            tlp.bottomMargin = dp(act, 4);
+            box.addView(tools, tlp);
+
+            TextView all = textBtn(act, "全选");
+            TextView none = textBtn(act, "全不选");
+            tools.addView(all);
+            tools.addView(none);
+            all.setOnClickListener(new View.OnClickListener() {
+                @Override public void onClick(View v) {
+                    try {
+                        SEL_BOOKS.clear();
+                        SEL_BOOKS.addAll(ids);
+                        refreshList(act);
+                    } catch (Throwable t) { log("!! 全选: " + t); }
+                }
+            });
+            none.setOnClickListener(new View.OnClickListener() {
+                @Override public void onClick(View v) {
+                    try { SEL_BOOKS.clear(); refreshList(act); }
+                    catch (Throwable t) { log("!! 全不选: " + t); }
+                }
+            });
+
+            TextView tip = new TextView(act);
+            tip.setText("可多选");
+            tip.setTextSize(11);
+            tip.setTextColor(0xFF8E8E94);
+            LinearLayout.LayoutParams tiplp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            tiplp.leftMargin = dp(act, 10);
+            tools.addView(tip, tiplp);
+
+            ScrollView sv = new ScrollView(act);
+            sv.setFillViewport(true);
+            LinearLayout list = new LinearLayout(act);
+            list.setOrientation(LinearLayout.VERTICAL);
+            for (int i = 0; i < ids.size(); i++) list.addView(bookRow(act, ids.get(i), i == 0));
+            sv.addView(list);
+            LinearLayout.LayoutParams slp2 = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            slp2.bottomMargin = dp(act, 6);
+            box.addView(sv, slp2);
+            PANEL_LIST = list;
+        }
 
         box.addView(divider(act));
 
-        // ── 手动导出（主操作）──
-        LinearLayout expRow = new LinearLayout(act);
-        expRow.setOrientation(LinearLayout.VERTICAL);
-        LinearLayout.LayoutParams erlp = new LinearLayout.LayoutParams(
+        // 统一导出按钮：文本随选中项变化，没选中时禁用（置灰+ 不可点）
+        final TextView expBtn = new TextView(act);
+        LinearLayout.LayoutParams elp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        erlp.topMargin = dp(act, 8);
-        erlp.bottomMargin = dp(act, 2);
-        box.addView(expRow, erlp);
-
-        TextView expBtn = new TextView(act);
-        expBtn.setText(exportBtnText());
-        expBtn.setTextSize(15);
-        expBtn.setGravity(Gravity.CENTER);
-        expBtn.setPadding(dp(act, 14), dp(act, 14), dp(act, 14), dp(act, 14));
-        GradientDrawable ebg = new GradientDrawable();
-        ebg.setCornerRadius(dp(act, 12));
-        ebg.setColor(0xFFFF5A5F);
-        expBtn.setBackground(ebg);
-        expBtn.setTextColor(0xFFFFFFFF);
-        expBtn.setClickable(true);
-        expBtn.setFocusable(true);
+        elp.topMargin = dp(act, 10);
+        elp.bottomMargin = dp(act, 2);
+        box.addView(expBtn, elp);
+        paintExportBtn(act, expBtn);
         expBtn.setOnClickListener(new View.OnClickListener() {
             @Override public void onClick(View v) {
-                try { exportBook(act); } catch (Throwable t) { log("!! exportBook: " + t); }
+                try { exportSelected(act); }
+                catch (Throwable t) { log("!! exportSelected: " + t); }
             }
         });
-        expRow.addView(expBtn, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        PANEL_EXPORT = expBtn;
 
         TextView expHint = new TextView(act);
-        expHint.setText(LAST_BOOK_ID == null
-                ? "① 先在番茄里打开本书，点阅读页顶部的「下载」\n"
-                + "② 再回到这里，点上面的「导出本书」"
-                : "已缓存 " + bufCount(LAST_BOOK_ID) + " 章 —— 点上面「导出本书」写出整本\n"
-                + "导出后自动与原始 XHTML 校对");
+        expHint.setText(exportHintText());
         expHint.setTextSize(11);
         expHint.setTextColor(0xFF8E8E94);
-        expHint.setLineSpacing(dp(act, 3), 1f);
-        expHint.setPadding(0, dp(act, 6), 0, 0);
-        expRow.addView(expHint);
-
-        box.addView(divider(act));
-
-        box.addView(formatRow(act, expBtn));
-
-        box.addView(switchRow(act, "自动导出",
-                "开 = 边读边导（旧行为）；关 = 只在你点上面按钮时落盘", cfgAuto, new BoolSet() {
-                    @Override public void set(boolean v) { cfgAuto = v; saveSwitch(); }
-                }));
-        box.addView(switchRow(act, "导出插图",
-                "把章节内嵌插图另存到「插图/」子目录", cfgImages, new BoolSet() {
-                    @Override public void set(boolean v) { cfgImages = v; saveSwitch(); }
-                }));
-        box.addView(switchRow(act, "保存 XHTML 原文",
-                "额外保留番茄原始排版文件（.xhtml）", cfgXhtml, new BoolSet() {
-                    @Override public void set(boolean v) { cfgXhtml = v; saveSwitch(); }
-                }));
-        box.addView(switchRow(act, "强制重新导出",
-                "忽略已导出记录，同一章再导一次（用于补文件）", cfgForce, new BoolSet() {
-                    @Override public void set(boolean v) { cfgForce = v; saveSwitch(); }
-                }));
+        expHint.setPadding(0, dp(act, 4), 0, 0);
+        box.addView(expHint);
+        PANEL_HINT = expHint;
 
         box.addView(divider(act));
 
@@ -2000,21 +2118,17 @@ public class MainHook implements IXposedHookLoadPackage {
         btns.setOrientation(LinearLayout.HORIZONTAL);
         LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        blp.topMargin = dp(act, 12);
+        blp.topMargin = dp(act, 10);
         box.addView(btns, blp);
 
-        btns.addView(button(act, "运行日志", false, new View.OnClickListener() {
+        btns.addView(button(act, "更多设置", false, new View.OnClickListener() {
             @Override public void onClick(View v) {
-                try { showLog(act); } catch (Throwable t) { log("!! showLog: " + t); }
-            }
-        }));
-        btns.addView(button(act, "校对报告", false, new View.OnClickListener() {
-            @Override public void onClick(View v) {
-                try { showVerify(act); } catch (Throwable t) { log("!! showVerify: " + t); }
+                try { d.dismiss(); showMore(act); }
+                catch (Throwable t) { log("!! showMore: " + t); }
             }
         }));
         btns.addView(button(act, "完成", true, new View.OnClickListener() {
-            @Override public void onClick(View v) { d.dismiss(); }
+            @Override public void onClick(View v) { clearPanelRefs(); d.dismiss(); }
         }));
 
         d.setContentView(box);
@@ -2023,7 +2137,96 @@ public class MainHook implements IXposedHookLoadPackage {
             w.setBackgroundDrawable(new ColorDrawable(0));
             w.setLayout(dp(act, 330), ViewGroup.LayoutParams.WRAP_CONTENT);
         }
+        // 点外面关闭也算关闭 —— 清掉引用，否则下次重绘会打到已销毁的 View
+        d.setOnDismissListener(new DialogInterface.OnDismissListener() {
+            @Override public void onDismiss(DialogInterface di) { clearPanelRefs(); }
+        });
         d.show();
+    }
+
+    private static void clearPanelRefs() {
+        PANEL_LIST = null;
+        PANEL_LABEL = null;
+        PANEL_EXPORT = null;
+        PANEL_HINT = null;
+    }
+
+    /** 顶部统计标签的文案，随选中状态变化 */
+    private static String listLabelText(List<String> ids) {
+        if (ids == null || ids.isEmpty()) return "还没有捕获到章节";
+        int totalCh = 0;
+        for (int i = 0; i < ids.size(); i++) totalCh += bufCount(ids.get(i));
+        return "已捕获 " + ids.size() + " 本 · 共 " + totalCh + " 章" + selTailText();
+    }
+
+    /** 选中摘要：0 本 / 单本书名 / 「N 本·M 章」 */
+    private static String selTailText() {
+        if (SEL_BOOKS.isEmpty()) return "（先勾选要导的书）";
+        if (SEL_BOOKS.size() == 1) {
+            return "（已选《" + cut(nameOf(SEL_BOOKS.iterator().next()), 14) + "》）";
+        }
+        int ch = 0;
+        for (String id : SEL_BOOKS) ch += bufCount(id);
+        return "（已选 " + SEL_BOOKS.size() + " 本 · " + ch + " 章）";
+    }
+
+    /** 按钮下方的提示行 */
+    private static String exportHintText() {
+        if (SEL_BOOKS.isEmpty()) return "先在上面勾选要导出的书（可多选）";
+        if (SEL_BOOKS.size() == 1) {
+            return "将导出《" + cut(nameOf(SEL_BOOKS.iterator().next()), 16)
+                    + "》　点上面的红色按钮开始";
+        }
+        return "将依次导出 " + SEL_BOOKS.size() + " 本"
+                + "　点上面的红色按钮开始（逐本进行，完一本再下一本）";
+    }
+
+    /** 统一导出按钮的文案（0 本= 引导；1 本 = 书名+章数；N 本 = 本数+总章数） */
+    private static String exportLabelText() {
+        int selN = SEL_BOOKS.size();
+        if (selN == 0) return "请先在上面勾选要导出的书";
+        int ch = 0;
+        for (String id : SEL_BOOKS) ch += bufCount(id);
+        if (selN == 1) {
+            return "导出《" + cut(nameOf(SEL_BOOKS.iterator().next()), 14) + "》· "
+                    + ch + " 章 [" + cfgFormat.toUpperCase(Locale.US) + "]";
+        }
+        return "导出 " + selN + " 本 · 共 " + ch + " 章 ["
+                + cfgFormat.toUpperCase(Locale.US) + "]";
+    }
+
+    /** 统一导出按钮的视觉状态：有选中=主色可点，无选中=置灰不可点 */
+    private void paintExportBtn(Context ctx, TextView btn) {
+        boolean ready = !SEL_BOOKS.isEmpty();
+        btn.setText(exportLabelText());
+        btn.setTextSize(ready ? 14 : 13);
+        btn.setGravity(Gravity.CENTER);
+        btn.setPadding(dp(ctx, 14), dp(ctx, 13), dp(ctx, 14), dp(ctx, 13));
+        GradientDrawable bg = new GradientDrawable();
+        bg.setCornerRadius(dp(ctx, 12));
+        bg.setColor(ready ? 0xFFFF5A5F : 0xFF2C2C31);
+        btn.setBackground(bg);
+        btn.setTextColor(ready ? 0xFFFFFFFF : 0xFF6E6E76);
+        btn.setClickable(ready);
+        btn.setFocusable(ready);
+        btn.setAlpha(ready ? 1.0f : 0.75f);
+    }
+
+    /** 原地重画列表 + 标签 + 导出按钮 + 提示（选中变化时调用，不关面板） */
+    private void refreshList(final Activity act) {
+        if (act == null || act.isFinishing()) return;
+        LinearLayout list = PANEL_LIST;
+        if (list == null) return;
+        List<String> ids = bookIdsByRecent();
+        // 番茄进程重启后 SEL_BOOKS 里可能有已消失的书 —— 清掉，否则按钮算出0 章
+        SEL_BOOKS.retainAll(ids);
+        if (SEL_BOOKS.isEmpty() && !ids.isEmpty()) SEL_BOOKS.add(ids.get(0));
+
+        list.removeAllViews();
+        for (int i = 0; i < ids.size(); i++) list.addView(bookRow(act, ids.get(i), i == 0));
+        if (PANEL_LABEL != null) PANEL_LABEL.setText(listLabelText(ids));
+        if (PANEL_EXPORT != null) paintExportBtn(act, PANEL_EXPORT);
+        if (PANEL_HINT != null) PANEL_HINT.setText(exportHintText());
     }
 
     private void showLog(final Activity act) {
@@ -2113,6 +2316,27 @@ public class MainHook implements IXposedHookLoadPackage {
         return v;
     }
 
+    /** 小号文字按钮（列表上方的「全选 / 全不选」这类辅助操作） */
+    private TextView textBtn(Context ctx, String label) {
+        TextView b = new TextView(ctx);
+        b.setText(label);
+        b.setTextSize(12);
+        b.setGravity(Gravity.CENTER);
+        b.setPadding(dp(ctx, 12), dp(ctx, 6), dp(ctx, 12), dp(ctx, 6));
+        b.setClickable(true);
+        b.setFocusable(true);
+        GradientDrawable bg = new GradientDrawable();
+        bg.setCornerRadius(dp(ctx, 8));
+        bg.setColor(0xFF2C2C31);
+        b.setBackground(bg);
+        b.setTextColor(0xFFD0D0D6);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.rightMargin = dp(ctx, 8);
+        b.setLayoutParams(lp);
+        return b;
+    }
+
     private View switchRow(Context ctx, String title, String sub, boolean init, final BoolSet cb) {
         LinearLayout row = new LinearLayout(ctx);
         row.setOrientation(LinearLayout.HORIZONTAL);
@@ -2160,6 +2384,145 @@ public class MainHook implements IXposedHookLoadPackage {
         return "导出本书"
                 + (LAST_BOOK_NAME != null ? " · " + LAST_BOOK_NAME : "")
                 + "　[" + cfgFormat.toUpperCase(Locale.US) + "]";
+    }
+
+    // ── 书籍列表的一行 ──────────────────────────────────────────
+    //  点整行 = 勾选/取消勾选这本书（可多选）；点底部按钮才导出。
+    private View bookRow(final Activity act, final String bookId, boolean isLatest) {
+        final boolean sel = SEL_BOOKS.contains(bookId);
+        LinearLayout row = new LinearLayout(act);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(dp(act, 12), dp(act, 11), dp(act, 8), dp(act, 11));
+        row.setClickable(true);
+        row.setFocusable(true);
+        GradientDrawable rb = new GradientDrawable();
+        rb.setCornerRadius(dp(act, 10));
+        // 选中态用主色描边+ 浅底，和未选中的一眼能分开
+        rb.setColor(sel ? 0xFF3A2A2E : (isLatest ? 0xFF2A2226 : 0xFF232327));
+        if (sel) rb.setStroke(dp(act, 1.5f), 0xFFFF5A5F);
+        row.setBackground(rb);
+
+        int n = bufCount(bookId);
+        String name = cut(nameOf(bookId), 18);
+
+        LinearLayout col = new LinearLayout(act);
+        col.setOrientation(LinearLayout.VERTICAL);
+        row.addView(col, new LinearLayout.LayoutParams(0,
+                ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        TextView t = new TextView(act);
+        t.setText(name);
+        t.setTextSize(15);
+        t.setTextColor(0xFFFFFFFF);
+        col.addView(t);
+
+        TextView s = new TextView(act);
+        String sub = n + " 章 · " + cfgFormat.toUpperCase(Locale.US);
+        if (isLatest) sub = "最近在读 · " + sub;
+        s.setText(sub);
+        s.setTextSize(11);
+        s.setTextColor(sel ? 0xFFFF9A9E : 0xFF8E8E94);
+        col.addView(s);
+
+        // 右侧不是按钮了，改成勾选指示器 —— 点整行翻转这一本的选中态
+        TextView mark = new TextView(act);
+        mark.setText(sel ? "☑ 已选" : "☐ 选择");
+        mark.setTextSize(12);
+        mark.setGravity(Gravity.CENTER);
+        mark.setPadding(dp(act, 10), dp(act, 6), dp(act, 10), dp(act, 6));
+        mark.setTextColor(sel ? 0xFFFF5A5F : 0xFF6E6E76);
+        row.addView(mark);
+
+        row.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                try { toggleBook(act, bookId); }
+                catch (Throwable t) { log("!! toggleBook: " + t); }
+            }
+        });
+        return row;
+    }
+
+    /** 翻转一本书的勾选态并原地重画列表（不关面板、不开始导出） */
+    private void toggleBook(final Activity act, final String bookId) {
+        if (!SEL_BOOKS.remove(bookId)) SEL_BOOKS.add(bookId);
+        try { refreshList(act); } catch (Throwable t) { log("!! refreshList: " + t); }
+    }
+
+    // ── 更多设置：格式 / 开关 / 日志 / 校对 ─────────────────────
+    private void showMore(final Activity act) {
+        if (act == null || act.isFinishing()) return;
+
+        final Dialog d = new Dialog(act);
+        d.requestWindowFeature(Window.FEATURE_NO_TITLE);
+        LinearLayout box = newDialogBox(act);
+
+        TextView t = new TextView(act);
+        t.setText("更多设置");
+        t.setTextSize(18);
+        t.setTextColor(0xFFFFFFFF);
+        box.addView(t);
+
+        TextView ver = new TextView(act);
+        ver.setText("输出目录 /sdcard/Download/番茄导出/");
+        ver.setTextSize(11);
+        ver.setTextColor(0xFF8E8E94);
+        LinearLayout.LayoutParams vlp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        vlp.topMargin = dp(act, 4);
+        vlp.bottomMargin = dp(act, 10);
+        box.addView(ver, vlp);
+
+        box.addView(formatRow(act, null));
+
+        box.addView(switchRow(act, "自动导出",
+                "开 = 边读边导（旧行为）；关 = 只在你点书名时落盘", cfgAuto, new BoolSet() {
+                    @Override public void set(boolean v) { cfgAuto = v; saveSwitch(); }
+                }));
+        box.addView(switchRow(act, "导出插图",
+                "把章节内嵌插图另存到「插图/」子目录", cfgImages, new BoolSet() {
+                    @Override public void set(boolean v) { cfgImages = v; saveSwitch(); }
+                }));
+        box.addView(switchRow(act, "保存 XHTML 原文",
+                "额外保留番茄原始排版文件（.xhtml）", cfgXhtml, new BoolSet() {
+                    @Override public void set(boolean v) { cfgXhtml = v; saveSwitch(); }
+                }));
+        box.addView(switchRow(act, "强制重新导出",
+                "忽略已导出记录，同一章再导一次（用于补文件）", cfgForce, new BoolSet() {
+                    @Override public void set(boolean v) { cfgForce = v; saveSwitch(); }
+                }));
+
+        box.addView(divider(act));
+
+        LinearLayout btns = new LinearLayout(act);
+        btns.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        blp.topMargin = dp(act, 12);
+        box.addView(btns, blp);
+
+        btns.addView(button(act, "运行日志", false, new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                try { d.dismiss(); showLog(act); } catch (Throwable t) { log("!! showLog: " + t); }
+            }
+        }));
+        btns.addView(button(act, "校对结果", false, new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                try { d.dismiss(); showVerify(act); }
+                catch (Throwable t) { log("!! showVerify: " + t); }
+            }
+        }));
+        btns.addView(button(act, "完成", true, new View.OnClickListener() {
+            @Override public void onClick(View v) { d.dismiss(); }
+        }));
+
+        d.setContentView(box);
+        Window w = d.getWindow();
+        if (w != null) {
+            w.setBackgroundDrawable(new ColorDrawable(0));
+            w.setLayout(dp(act, 330), ViewGroup.LayoutParams.WRAP_CONTENT);
+        }
+        d.show();
     }
 
     // ── 导出格式：txt / epub 二选一 ──
@@ -2287,8 +2650,121 @@ public class MainHook implements IXposedHookLoadPackage {
         return (m == null) ? 0 : m.size();
     }
 
+    /** 台账里的书籍清单，最近捕获的排最前 */
+    private static List<String> bookIdsByRecent() {
+        List<String> ids = new ArrayList<String>(BUF.keySet());
+        Collections.sort(ids, new Comparator<String>() {
+            @Override public int compare(String a, String b) {
+                Long x = BOOK_SEEN.get(a), y = BOOK_SEEN.get(b);
+                long xa = (x == null) ? 0L : x.longValue();
+                long ya = (y == null) ? 0L : y.longValue();
+                if (xa != ya) return (xa > ya) ? -1 : 1;
+                return String.valueOf(nameOf(a)).compareTo(String.valueOf(nameOf(b)));
+            }
+        });
+        return ids;
+    }
+
+    private static String nameOf(String bookId) {
+        String n = BOOK_NAME.get(bookId);
+        return notEmpty(n) ? n : ("book_" + bookId);
+    }
+
     private void exportBook(final Activity act) {
-        final String bid = LAST_BOOK_ID;
+        exportBook(act, LAST_BOOK_ID);
+    }
+
+    /**
+     *  批量导出：把面板里勾选的书按列表顺序（最近读的排最前）逐本导出。
+     *
+     *  为什么串行而不是并发：
+     *   · 所有书都写进同一个 Download 目录，插图文件名带书名前缀但仍可能撞名；
+     *   · EXPORTING 是单飞锁，本来就不允许两个导出任务并发；
+     *   · 进度弹窗只有一个，串行才能给出一个 0~100% 的整体进度。
+     *  选中集在提交时快照成 todo —— 用户可以在导出过程中继续改勾选，
+     *  不会把正在跑的任务内容改掉。
+     */
+    private void exportSelected(final Activity act) {
+        if (SEL_BOOKS.isEmpty()) {
+            toast(act, "先在上面勾选要导出的书");
+            return;
+        }
+        List<String> ids = bookIdsByRecent();
+        final ArrayList<String> todo = new ArrayList<String>();
+        for (int i = 0; i < ids.size(); i++) {
+            String id = ids.get(i);
+            if (SEL_BOOKS.contains(id) && bufCount(id) > 0) todo.add(id);
+        }
+        if (todo.isEmpty()) {
+            toast(act, "勾选的书里还没有捕获到章节 —— 先在番茄里点「下载」或往下翻几章");
+            return;
+        }
+        if (!EXPORTING.compareAndSet(false, true)) {
+            toast(act, "已有导出任务在进行，等它跑完再点");
+            return;
+        }
+        final int n = todo.size();
+        final Prog prog = showProgress(act, "导出 " + n + " 本");
+        try {
+            POOL.execute(new Runnable() {
+                @Override public void run() {
+                    StringBuilder all = new StringBuilder();
+                    ArrayList<String> failed = new ArrayList<String>();
+                    try {
+                        for (int i = 0; i < n; i++) {
+                            String bid = todo.get(i);
+                            String book = nameOf(bid);
+                            Map<String, ChapterBuf> m = BUF.get(bid);
+                            // 每本书各占进度条的一段，总和精确等于 100
+                            int base = i * 100 / n;
+                            int span = (i + 1) * 100 / n - base;
+                            if (prog != null) {
+                                prog.range(base, span);
+                                prog.set(0, "[" + (i + 1) + "/" + n + "] 《"
+                                        + cut(book, 12) + "》准备中…");
+                            }
+                            try {
+                                all.append(doExportBook(bid, book, m, prog)).append("\n\n");
+                            } catch (Throwable t) {
+                                log("!! doExportBook(" + book + "): " + t);
+                                all.append("✘ 导出《").append(book).append("》失败：").append(t)
+                                        .append("\n\n");
+                                failed.add(book);
+                            }
+                        }
+                    } finally {
+                        EXPORTING.set(false);
+                    }
+                    int ok = n - failed.size();
+                    String head = (ok == n ? "✔ " : "✘ ") + "共 " + n + " 本，成功 " + ok
+                            + " 本";
+                    if (!failed.isEmpty()) {
+                        head += "，失败：" + cut(joinNames(failed), 40);
+                    }
+                    if (prog != null) prog.done(head + "\n" + all.toString());
+                    else toast(act, head);
+                }
+            });
+        } catch (Throwable t) {
+            EXPORTING.set(false);     // 提交失败（例如池已异常）不能把锁吞掉
+            log("!! 批量导出任务提交失败: " + t);
+            toast(act, "导出任务提交失败: " + t);
+        }
+    }
+
+    /** 把一批书名拼成一行摘要 */
+    private static String joinNames(List<String> names) {
+        StringBuilder b = new StringBuilder();
+        for (int i = 0; i < names.size(); i++) {
+            if (i > 0) b.append('、');
+            b.append('《').append(names.get(i)).append('》');
+        }
+        return b.toString();
+    }
+
+    /** 导出指定 bookId 的全部缓冲章节；bookId 为 null 时回退到最近捕获的那本 */
+    private void exportBook(final Activity act, final String bookId) {
+        final String bid = (bookId == null) ? LAST_BOOK_ID : bookId;
         if (bid == null) {
             toast(act, "还没捕获到章节 —— 先在番茄里打开本书，点阅读页顶部的「下载」");
             return;
@@ -2298,21 +2774,33 @@ public class MainHook implements IXposedHookLoadPackage {
             toast(act, "暂无可导出的章节");
             return;
         }
-        final String book = (LAST_BOOK_NAME == null) ? UNKNOWN_BOOK : LAST_BOOK_NAME;
+        // 单飞：同一时刻只允许一个导出任务，避免并发写同一目录
+        if (!EXPORTING.compareAndSet(false, true)) {
+            toast(act, "已有导出任务在进行，等它跑完再点");
+            return;
+        }
+        final String book = nameOf(bid);
         final Prog prog = showProgress(act, "导出《" + book + "》");
-        POOL.execute(new Runnable() {
-            @Override public void run() {
-                String summary;
-                try {
-                    summary = doExportBook(bid, book, m, prog);
-                } catch (Throwable t) {
-                    log("!! doExportBook: " + t);
-                    summary = "导出失败: " + t;
+        try {
+            POOL.execute(new Runnable() {
+                @Override public void run() {
+                    String summary;
+                    try {
+                        summary = doExportBook(bid, book, m, prog);
+                    } catch (Throwable t) {
+                        log("!! doExportBook: " + t);
+                        summary = "导出失败: " + t;
+                    }
+                    if (prog != null) prog.done(summary);
+                    else toast(act, summary.replace('\n', ' '));
+                    EXPORTING.set(false);
                 }
-                if (prog != null) prog.done(summary);
-                else toast(act, summary.replace('\n', ' '));
-            }
-        });
+            });
+        } catch (Throwable t) {
+            EXPORTING.set(false);     // 提交失败（例如池已异常）不能把锁吞掉
+            log("!! 导出任务提交失败: " + t);
+            toast(act, "导出任务提交失败: " + t);
+        }
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -2326,6 +2814,8 @@ public class MainHook implements IXposedHookLoadPackage {
         int srcImgDivs;    // 原始 XHTML 里 image div 数
         int outChars;      // 导出侧正文非空白字符数
         int outImgs;       // 实际嵌出的插图数
+        boolean degraded;  // 走了兜底解析（结构丢失）—— 字数对比不可信
+        int illegalXml;    // 被 esc() 替换掉的 XML 非法字符数
     }
 
     /**
@@ -2347,8 +2837,10 @@ public class MainHook implements IXposedHookLoadPackage {
 
         final boolean epub = FMT_EPUB.equals(cfgFormat);
         String head = "《" + book + "》";
-        String stamp = TS.format(new Date());
-        String rel = REL_ROOT + "/" + safe(book, 60);
+        String stamp = ts();
+        // 导出物直接落在根目录，文件名自带书名 —— 不再为每本书建子文件夹。
+        // 用户要的是「打开 Download 就看到一堆小说文件」，多套一层目录就得多点一次。
+        String rel = REL_ROOT;
         String base = safe(book, 80);
         int total = list.size();
 
@@ -2359,12 +2851,15 @@ public class MainHook implements IXposedHookLoadPackage {
             ChapterBuf c = list.get(i);
             String xml = new String(c.xml, UTF8);
             ChapDoc d = new ChapDoc();
+            boolean[] deg = new boolean[1];
             d.title = (c.title == null || c.title.isEmpty()) ? ("第" + (i + 1) + "章") : c.title;
-            d.blks = extractBlocks(xml, bookId, null);
+            d.blks = extractBlocks(xml, bookId, null, deg);
+            d.degraded = deg[0];
             d.srcChars = rawTextLen(xml);
             d.srcBlkTags = countOf(xml, "<blk");
             d.srcImgDivs = countImgDivs(xml);
             d.outChars = outChars(d.blks);
+            for (int k = 0; k < d.blks.size(); k++) d.illegalXml += countIllegalXml(d.blks.get(k).text);
             docs.add(d);
             if (prog != null) prog.set(55 * (i + 1) / Math.max(1, total),
                     "解析章节 " + (i + 1) + "/" + total);
@@ -2399,15 +2894,21 @@ public class MainHook implements IXposedHookLoadPackage {
             if (eb == null) {
                 summary = "✘ EPUB 打包失败（见运行日志）";
             } else {
-                boolean w = writePublic(rel, base + ".epub", eb, "application/epub+zip");
+                int okc = 0;
                 for (int i = 0; i < docs.size(); i++) {
                     ChapDoc d = docs.get(i);
                     if (d.blks.isEmpty()) continue;
-                    ok++;
+                    okc++;
                     imgOk += d.outImgs;
                 }
-                summary = (w ? "✔ " : "✘ ") + "导出 EPUB《" + book + "》 " + ok + "/" + total
-                        + " 章 · 插图 " + imgOk + " 张 · " + (eb.length / 1024) + " KB";
+                ok = okc;
+                // 自检必须在写盘前跑：产物不成立就不该让用户以为导出成功了
+                String chk = epubSelfCheck(eb, okc, imgData.size());
+                boolean w = writePublic(rel, base + ".epub", eb, "application/epub+zip");
+                boolean pass = chk.startsWith("✔");
+                summary = ((w && pass) ? "✔ " : "✘ ") + "导出 EPUB《" + book + "》 " + ok + "/" + total
+                        + " 章 · 插图 " + imgOk + " 张 · " + (eb.length / 1024) + " KB"
+                        + "\n" + chk;
             }
         } else {
             StringBuilder txt = new StringBuilder(1 << 16);
@@ -2447,13 +2948,15 @@ public class MainHook implements IXposedHookLoadPackage {
                         }
                     } else if (b.kind == Blk.IMG) {
                         String fn = (b.imgKey == null) ? null : keyToFile.get(b.imgKey);
-                        if (fn != null && imgData.containsKey(fn)) {
-                            if (writePublic(rel + "/插图", fn, imgData.get(fn), imgMime.get(fn))) {
-                                h.append("<img src=\"插图/").append(fn)
-                                 .append("\" alt=\"插图\" loading=\"lazy\">\n");
-                                imgs++;
+if (fn != null && imgData.containsKey(fn)) {
+                                // 文件名前缀书名，避免多本书的插图在根目录互相覆盖
+                                String imgName = base + "_" + fn;
+                                if (writePublic(rel, imgName, imgData.get(fn), imgMime.get(fn))) {
+                                    h.append("<img src=\"").append(imgName)
+                                     .append("\" alt=\"插图\" loading=\"lazy\">\n");
+                                    imgs++;
+                                }
                             }
-                        }
                         if (b.text != null && !b.text.isEmpty()) {
                             txt.append("［插图］").append(b.text).append('\n');
                             h.append("<p class=\"cap\">").append(esc(b.text)).append("</p>\n");
@@ -2478,16 +2981,18 @@ public class MainHook implements IXposedHookLoadPackage {
                     + " 字 / html " + h.length() + " 字";
         }
 
-        // ── 4) 与原始排版 XHTML 校对 ──
+        // ── 4) 校对：结论只进运行日志，不再单独写 _校对报告.txt ──
+        //  用户明确要求「只要书名文件」——每本书再套个文件夹、又多个校对报告文件，
+        //  打开目录根本一眼看不到小说。校对本身不删（仍算仍判级），只换落点。
         if (prog != null) prog.set(94, "与原始 XHTML 校对…");
         String report = verifyReport(book, stamp, epub, docs, summary);
-        boolean rv = writePublic(rel, VERIFY_FILE, report.getBytes(UTF8), "text/plain");
         String brief = verifyBrief(docs);
         if (prog != null) prog.set(100, "完成");
 
         log(summary + " -> " + rel);
-        log((rv ? "校对报告已写出: " : "!! 校对报告写出失败: ") + rel + "/" + VERIFY_FILE
-                + " | " + brief);
+        log("校对: " + brief);
+        // 完整报告进日志文件（面板里「运行日志」能看），不占Download 目录
+        log(report);
         flushLog(true);
         return summary + "\n\n" + brief;
     }
@@ -2623,7 +3128,7 @@ public class MainHook implements IXposedHookLoadPackage {
                .append("    <dc:language>zh</dc:language>\n")
                .append("    <dc:identifier id=\"bookid\">").append(uuid).append("</dc:identifier>\n")
                .append("    <dc:creator>番茄小说</dc:creator>\n")
-               .append("    <dc:date>").append(stamp).append("</dc:date>\n")
+               .append("    <dc:date>").append(iso()).append("</dc:date>\n")
                .append("    <meta name=\"fq:chapters\" content=\"").append(ok).append("\"/>\n")
                .append("    <meta name=\"fq:images\" content=\"").append(imgOk).append("\"/>\n")
                .append("  </metadata>\n")
@@ -2668,6 +3173,119 @@ public class MainHook implements IXposedHookLoadPackage {
         z.putNextEntry(e);
         z.write(data);
         z.closeEntry();
+    }
+
+    /**
+     * EPUB 导出后自检（纯 JDK，不依赖 epubcheck）。
+     *
+     * 为什么必须有：原来模块只校「字数/插图数」，对 EPUB 文件本身零校验。
+     * 一个 XML 非法字符、一个 manifest 引用了不存在的条目，产物就已经是废的，
+     * 但报告照样 ✔。这里把「文件本身是否成立」变成可观测的。
+     *
+     * 校验项：
+     *   1. 第一个 local file header 必须是 mimetype（裸字节校验，不依赖 ZipInputStream 行为）
+     *   2. mimetype 必须 STORED(0)、内容为 application/epub+zip
+     *   3. 必备条目齐全：META-INF/container.xml、OEBPS/content.opf、OEBPS/toc.ncx、OEBPS/style.css
+     *   4. OEBPS/text/*.xhtml 数 == 声明章数；OEBPS/images/* 数 == 声明插图数
+     *   5. content.opf 里 manifest 的每个 href 都能在 zip 内找到
+     *   6. 所有条目可完整读出（流截断/损坏即失败）
+     *
+     * @return 单行结论，以 "✔ " 开头表示通过
+     */
+    private static String epubSelfCheck(byte[] epb, int expectCh, int expectImg) {
+        if (epb == null || epb.length == 0) return "✘ EPUB 自检：产物为空";
+        List<String> bad = new ArrayList<String>();
+
+        // ── 1/2 裸字节校验第一个条目 ──
+        if (epb.length < 34) {
+            bad.add("文件过短");
+        } else {
+            int sig = (epb[0] & 0xff) | ((epb[1] & 0xff) << 8)
+                    | ((epb[2] & 0xff) << 16) | ((epb[3] & 0xff) << 24);
+            if (sig != 0x04034b50) {
+                bad.add("首字节不是 zip local file header");
+            } else {
+                int method = (epb[8] & 0xff) | ((epb[9] & 0xff) << 8);
+                int nlen = (epb[26] & 0xff) | ((epb[27] & 0xff) << 8);
+                int maxName = Math.min(nlen, epb.length - 30);
+                String fn = (maxName > 0) ? new String(epb, 30, maxName, UTF8) : "";
+                if (!"mimetype".equals(fn)) bad.add("第一个条目是「" + fn + "」而非 mimetype");
+                if (method != 0) bad.add("mimetype 的压缩方式不是 STORED（method=" + method + "）");
+            }
+        }
+
+        // ── 读全部条目 ──
+        Set<String> names = new HashSet<String>();
+        byte[] opf = null;
+        String mimetype = null;
+        int ch = 0, img = 0;
+        ZipInputStream in = null;
+        try {
+            in = new ZipInputStream(new ByteArrayInputStream(epb));
+            byte[] buf = new byte[16384];
+            ZipEntry e;
+            while ((e = in.getNextEntry()) != null) {
+                String nm = e.getName();
+                names.add(nm);
+                if (nm.startsWith("OEBPS/text/") && nm.endsWith(".xhtml")) ch++;
+                if (nm.startsWith("OEBPS/images/")) img++;
+                ByteArrayOutputStream bo = new ByteArrayOutputStream();
+                int r;
+                while ((r = in.read(buf)) > 0) bo.write(buf, 0, r);
+                if ("mimetype".equals(nm)) mimetype = new String(bo.toByteArray(), UTF8).trim();
+                else if ("OEBPS/content.opf".equals(nm)) opf = bo.toByteArray();
+                in.closeEntry();
+            }
+        } catch (Throwable t) {
+            bad.add("zip 读取失败: " + t);
+        } finally {
+            if (in != null) {
+                try { in.close(); } catch (Throwable ignore) {}
+            }
+        }
+
+        if (!"application/epub+zip".equals(mimetype)) {
+            bad.add("mimetype 内容异常: " + mimetype);
+        }
+        String[] must = {"META-INF/container.xml", "OEBPS/content.opf", "OEBPS/toc.ncx", "OEBPS/style.css"};
+        for (int i = 0; i < must.length; i++) {
+            if (!names.contains(must[i])) bad.add("缺条目 " + must[i]);
+        }
+        if (ch != expectCh) bad.add("章节文件数 " + ch + " != 声明 " + expectCh);
+        if (img != expectImg) bad.add("插图文件数 " + img + " != 声明 " + expectImg);
+
+        // ── 5 manifest 引用完整性 ──
+        int hrefs = 0;
+        if (opf != null) {
+            String s = new String(opf, UTF8);
+            int i = 0;
+            while (true) {
+                int a = s.indexOf("href=\"", i);
+                if (a < 0) break;
+                int b = s.indexOf('"', a + 6);
+                if (b < 0) break;
+                String href = s.substring(a + 6, b);
+                i = b + 1;
+                if (href.startsWith("http") || href.startsWith("#")) continue;
+                hrefs++;
+                if (!names.contains("OEBPS/" + href)) bad.add("manifest 引用了不存在的条目 OEBPS/" + href);
+            }
+        } else {
+            bad.add("读不到 content.opf");
+        }
+
+        if (!bad.isEmpty()) {
+            StringBuilder sb = new StringBuilder("✘ EPUB 自检失败(").append(bad.size()).append(" 项): ");
+            for (int i = 0; i < bad.size() && i < 6; i++) {
+                if (i > 0) sb.append("; ");
+                sb.append(bad.get(i));
+            }
+            if (bad.size() > 6) sb.append(" …");
+            return sb.toString();
+        }
+        return "✔ EPUB 自检通过：mimetype(STORED 首条目) · 必备条目齐全 · 章 "
+                + ch + "/" + expectCh + " · 图 " + img + "/" + expectImg
+                + " · manifest 引用 " + hrefs + " 项全部命中";
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -2725,81 +3343,118 @@ public class MainHook implements IXposedHookLoadPackage {
         return n;
     }
 
-    /** 校对统计（章节/字数/图） */
+    /**
+     * 校对统计。
+     *
+     * 返回 {可导出章数, 源字数, 导出字数, 源插图, 导出插图, 差异章, 空章, 降级章, 非法字符}
+     *
+     * 注意「差异章」原本的判定会漏掉两类致命情况，现在分开统计：
+     *   - 空章     ：捕获到了但解析不出正文 → 导出里根本没这一章
+     *   - 降级章   ：走了兜底解析，字数与源侧几乎必然相等 → 绝不能计入「一致」
+     */
     private static int[] verifyStats(List<ChapDoc> docs) {
-        int chap = 0, src = 0, out = 0, si = 0, oi = 0, bad = 0;
+        int chap = 0, src = 0, out = 0, si = 0, oi = 0, bad = 0, empty = 0, deg = 0, illegal = 0;
         for (int i = 0; i < docs.size(); i++) {
             ChapDoc d = docs.get(i);
-            if (d.blks.isEmpty()) continue;
+            illegal += d.illegalXml;
+            if (d.blks.isEmpty()) { empty++; continue; }
             chap++;
+            if (d.degraded) deg++;
             src += d.srcChars;
             out += d.outChars;
             si += d.srcImgDivs;
             oi += d.outImgs;
             if (d.outChars != d.srcChars || d.outImgs < d.srcImgDivs) bad++;
         }
-        return new int[]{chap, src, out, si, oi, bad};
+        return new int[]{chap, src, out, si, oi, bad, empty, deg, illegal};
+    }
+
+    /**
+     * 结论分级。任何一级异常都不允许出现「✔」。
+     * 顺序按严重度：空章 > 降级 > 字数偏差 > 一致。
+     */
+    private static String verdictOf(int[] s, int total) {
+        if (s[6] > 0) {
+            return "✘ " + s[6] + " 章解析不出正文（导出里缺这些章，见清单）";
+        }
+        if (s[7] > 0) {
+            return "✘ " + s[7] + " 章走了兜底解析（结构丢失）—— 字数虽对齐但内容不可信";
+        }
+        if (s[5] > 0) {
+            return "✘ " + s[5] + " 章存在差异（明细见下）";
+        }
+        if (s[0] < total) {
+            return "✘ 仅 " + s[0] + "/" + total + " 章有正文";
+        }
+        return "✔ 与原始排版一致，未发现丢字/丢块";
     }
 
     private static String verifyBrief(List<ChapDoc> docs) {
         int[] s = verifyStats(docs);
-        String verdict = (s[5] == 0)
-                ? "✔ 与原始 XHTML 逐字一致"
-                : "✘ " + s[5] + " 章存在差异";
-        return "校对：" + verdict + "（章节 " + s[0] + " · 正文 "
+        return "校对：" + verdictOf(s, docs.size()) + "（章节 " + s[0] + "/" + docs.size() + " · 正文 "
                 + String.format(Locale.US, "%,d", s[2]) + "/"
                 + String.format(Locale.US, "%,d", s[1]) + " 字 · 插图 " + s[4] + "/" + s[3] + "）";
     }
 
-    /** 完整校对报告（写成 _校对报告.txt） */
+    /** 完整校对报告（写进运行日志，不再单独生成 _校对报告.txt） */
     private String verifyReport(String book, String stamp, boolean epub,
                                 List<ChapDoc> docs, String summary) {
         int[] s = verifyStats(docs);
+        int total = docs.size();
         StringBuilder r = new StringBuilder(1 << 12);
         r.append("《").append(book).append("》导出校对报告\n");
         r.append("时间 ").append(stamp).append('\n');
         r.append("格式 ").append(epub ? "EPUB" : "TXT").append('\n');
         r.append("──────────────────────────────\n");
         r.append("导出结果  ").append(summary.replace('\n', ' ')).append('\n');
-        r.append("章节      ").append(s[0]).append(" / ").append(docs.size()).append('\n');
+        r.append("章节      ").append(s[0]).append(" / ").append(total)
+         .append("  （分母 = 模块本次捕获到的章节数，不是番茄目录总数）\n");
         r.append("正文      ").append(String.format(Locale.US, "%,d", s[2]))
          .append(" 字  |  原始 XHTML ").append(String.format(Locale.US, "%,d", s[1]))
          .append(" 字  |  偏差 ").append(String.format(Locale.US, "%+,d", s[2] - s[1])).append('\n');
         r.append("插图      ").append(s[4]).append(" / ").append(s[3]).append(" 张\n");
+        if (s[6] > 0) r.append("空章      ").append(s[6]).append(" 章（有密文但解析不出正文）\n");
+        if (s[7] > 0) r.append("降级      ").append(s[7]).append(" 章（兜底解析，结构丢失）\n");
+        if (s[8] > 0) r.append("脏字符    ").append(s[8]).append(" 个（XML 非法，已替换为 U+FFFD）\n");
         r.append("──────────────────────────────\n");
-        r.append("结论      ").append(s[5] == 0
-                ? "✔ 与原始排版一致，未发现丢字/丢块"
-                : "✘ " + s[5] + " 章存在差异（明细见下）").append('\n');
+        r.append("结论      ").append(verdictOf(s, total)).append('\n');
+        // 分母是「捕获到的」而非「番茄目录总数」：没被捕获的章节在模块里没有任何记录，
+        // 无法列出。要拿到真实总数必须读番茄的目录缓存（CatalogCache）—— 尚未实现。
+        r.append("          ⚠ 未被捕获的章节在此报告中不可见（模块拿不到番茄目录总数）。\n");
 
-        if (s[5] > 0) {
-            r.append("\n逐章差异：\n");
-            r.append("  序号   章节                          字数(导出/原始)  插图(导出/原始)\n");
+        if (s[5] > 0 || s[7] > 0) {
+            r.append("\n逐章明细（差异 / 降级）：\n");
+            r.append("  序号   章节                          字数(导出/原始)  插图(导出/原始)  标记\n");
             for (int i = 0; i < docs.size(); i++) {
                 ChapDoc d = docs.get(i);
                 if (d.blks.isEmpty()) continue;
-                if (d.outChars == d.srcChars && d.outImgs >= d.srcImgDivs) continue;
-                r.append(String.format(Locale.US, "  %-6s %-28s %6d/%-6d   %2d/%2d\n",
+                boolean diff = (d.outChars != d.srcChars || d.outImgs < d.srcImgDivs);
+                if (!diff && !d.degraded) continue;
+                r.append(String.format(Locale.US, "  %-6s %-28s %6d/%-6d   %2d/%2d        %s\n",
                         String.format(Locale.US, "%04d", i + 1),
-                        cut(d.title, 28), d.outChars, d.srcChars, d.outImgs, d.srcImgDivs));
+                        cut(d.title, 28), d.outChars, d.srcChars, d.outImgs, d.srcImgDivs,
+                        d.degraded ? "降级" : "字数/图差异"));
             }
         }
 
-        // 空章节单独列出（解析为空的，最可能是 hook 没覆盖到）
+        // 空章节单独列出（解析为空的，最可能是 hook 没覆盖到或宿主改版）
         int empty = 0;
         StringBuilder em = new StringBuilder();
         for (int i = 0; i < docs.size(); i++) {
             if (!docs.get(i).blks.isEmpty()) continue;
             empty++;
-            if (empty <= 20) {
+            if (empty <= 40) {
                 em.append("  ").append(String.format(Locale.US, "%04d", i + 1))
                   .append(' ').append(cut(docs.get(i).title, 28)).append('\n');
             }
         }
         if (empty > 0) {
             r.append("\n解析为空的章节 ").append(empty).append(" 章")
-             .append(empty > 20 ? "（只列前 20）" : "").append("：\n").append(em);
+             .append(empty > 40 ? "（只列前 40）" : "").append("：\n").append(em);
         }
         r.append("\n注：字数按「非空白字符」计，图注计入正文；偏差 0 表示逐字对齐。\n");
+        r.append("    结论只看「字数偏差」是不够的 —— 兜底解析会让字数虚假对齐，\n");
+        r.append("    所以该路径单独标记为「降级」并禁止给出正向结论。\n");
         return r.toString();
     }
 
@@ -2809,22 +3464,47 @@ public class MainHook implements IXposedHookLoadPackage {
         return (s.length() <= max) ? s : s.substring(0, max);
     }
 
+    /**
+     * 从运行日志里捞出最近一次校对报告全文。
+     * v1.9.0 起校对报告不再单独落文件（Download 里只留小说），改为写进 _运行日志.txt。
+     * 找到「导出校对报告」这一行就一路读到下一个空行为止。
+     */
+    private String lastVerifyFromLog() {
+        try { flushLog(true); } catch (Throwable ignore) {}
+        byte[] b = readPublic(REL_ROOT, LOG_FILE);
+        if (b == null) return null;
+        String all = new String(b, UTF8);
+        String[] lines = all.split("\n");
+        int end = -1;
+        for (int i = lines.length - 1; i >= 0; i--) {
+            if (lines[i].indexOf("导出校对报告") >= 0) { end = i; break; }
+        }
+        if (end < 0) return null;
+        StringBuilder sb = new StringBuilder();
+        for (int i = end; i < lines.length; i++) {
+            if (i > end && lines[i].trim().isEmpty()) break;
+            // 剥掉日志行首的时间戳前缀（形如 "10-12 20:20:56  "）
+            String ln = lines[i];
+            int cut = ln.indexOf("  ");
+            if (cut > 0 && ln.length() > cut + 2) ln = ln.substring(cut + 2);
+            sb.append(ln).append('\n');
+        }
+        return sb.length() == 0 ? null : sb.toString();
+    }
+
     private void showVerify(final Activity act) {
         if (act == null || act.isFinishing()) return;
-        if (LAST_BOOK_NAME == null) {
-            toast(act, "还没有导出记录");
-            return;
-        }
-        byte[] b = readPublic(REL_ROOT + "/" + safe(LAST_BOOK_NAME, 60), VERIFY_FILE);
-        String txt = (b == null) ? null : new String(b, UTF8);
-        if (txt == null || txt.trim().isEmpty()) txt = "(暂无校对报告 —— 先点「导出本书」)";
+        // v1.9.0 起不再写 _校对报告.txt（用户要求 Download 里只留小说文件），
+        // 校对全文已经打进运行日志 —— 这里从日志里把校对段落捞出来显示。
+        String txt = lastVerifyFromLog();
+        if (txt == null) txt = "(暂无校对记录 —— 先导出一次)";
 
         final Dialog d = new Dialog(act);
         d.requestWindowFeature(Window.FEATURE_NO_TITLE);
         LinearLayout box = newDialogBox(act);
 
         TextView t = new TextView(act);
-        t.setText("校对报告");
+        t.setText("校对结果");
         t.setTextSize(16);
         t.setTextColor(0xFFFFFFFF);
         box.addView(t);
@@ -2868,15 +3548,34 @@ public class MainHook implements IXposedHookLoadPackage {
         final TextView label;
         final ProgressBar bar;
         final TextView close;
+        /**
+         *  当前这一本在整条进度条里的区段 [base, base+span)。
+         *  批量导出时每本书占一段，set(pct) 里的 pct 会被映射进本段，
+         *  这样 N 本书的进度连起来正好是 0→100 而不会每本都从头再来。
+         */
+        volatile int base;
+        volatile int span = 100;
         Prog(Activity a, Dialog dd, TextView l, ProgressBar b, TextView c) {
             act = a; d = dd; label = l; bar = b; close = c;
         }
-        /** 从任意线程更新进度 */
+        /** 切换到下一份文档：base = 起始百分比，span = 本份占的宽度 */
+        void range(final int b, final int s) {
+            // 也走 UI 线程：保证「上一本的最后一次 set」先于「下一本的 range」执行，
+            // 否则上一本收尾的那帧会拿着新区段算百分比，进度条会跳。
+            act.runOnUiThread(new Runnable() {
+                @Override public void run() {
+                    base = b;
+                    span = (s <= 0) ? 1 : s;
+                }
+            });
+        }
+        /** 从任意线程更新进度（pct 为本份文档内部的 0~100） */
         void set(final int pct, final String msg) {
             act.runOnUiThread(new Runnable() {
                 @Override public void run() {
                     try {
-                        bar.setProgress(pct < 0 ? 0 : (pct > 100 ? 100 : pct));
+                        int p = pct < 0 ? 0 : (pct > 100 ? 100 : pct);
+                        bar.setProgress(base + span * p / 100);
                         label.setText(msg);
                     } catch (Throwable ignore) {}
                 }
@@ -2970,7 +3669,15 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    /** HTML 转义 */
+    /**
+     * HTML / XML 转义。
+     *
+     * 除了转义 5 个特殊字符，还必须**剔除 XML 1.0 非法码点**：
+     * EPUB 里的每章是严格 XML，混进一个控制字符（0x00-0x08 / 0x0B / 0x0C /
+     * 0x0E-0x1F / 0xFFFE-0xFFFF）就会让阅读器判定「文件损坏」，
+     * 整本 EPUB 打不开 —— 而模块内部原来自检为零，报告还显示 ✔。
+     * 非法字符统一替换成 U+FFFD（替换字符），保留字符计数与可读性。
+     */
     private static String esc(String s) {
         if (s == null) return "";
         StringBuilder b = new StringBuilder(s.length() + 16);
@@ -2981,10 +3688,49 @@ public class MainHook implements IXposedHookLoadPackage {
                 case '<': b.append("&lt;"); break;
                 case '>': b.append("&gt;"); break;
                 case '"': b.append("&quot;"); break;
-                default: b.append(c);
+                case '\'': b.append("&#39;"); break;
+                default:
+                    if (xmlSafe(c)) {
+                        b.append(c);
+                    } else if (c >= '\uD800' && c <= '\uDBFF') {
+                        // 高位代理：紧跟合法低位代理则整体保留（emoji 等增补平面字符）
+                        if (i + 1 < s.length()
+                                && s.charAt(i + 1) >= '\uDC00' && s.charAt(i + 1) <= '\uDFFF') {
+                            b.append(c).append(s.charAt(i + 1));
+                            i++;
+                        } else {
+                            b.append('\uFFFD');   // 孤立代理 → 替换
+                        }
+                    } else {
+                        b.append('\uFFFD');
+                    }
             }
         }
         return b.toString();
+    }
+
+    /** XML 1.0 允许的码点（不含代理区，代理由调用方成对处理） */
+    private static boolean xmlSafe(char c) {
+        if (c == 0x09 || c == 0x0A || c == 0x0D) return true;
+        if (c >= 0x20 && c <= 0xD7FF) return true;
+        if (c >= 0xE000 && c <= 0xFFFD) return true;
+        return false;
+    }
+
+    /** 统计会被 esc() 替换掉的非法字符数（校对报告用来提示脏数据） */
+    private static int countIllegalXml(String s) {
+        if (s == null) return 0;
+        int n = 0;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c >= '\uD800' && c <= '\uDBFF') {
+                if (i + 1 < s.length() && s.charAt(i + 1) >= '\uDC00' && s.charAt(i + 1) <= '\uDFFF') i++;
+                else n++;
+            } else if (!xmlSafe(c)) {
+                n++;
+            }
+        }
+        return n;
     }
 
     private static void toast(final Activity a, final String s) {
